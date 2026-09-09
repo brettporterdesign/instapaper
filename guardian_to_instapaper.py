@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-Fetch the latest Guardian Australia articles and push any new ones to Instapaper.
+Fetch the latest Guardian Australia articles (general + technology) and
+push any new ones to Instapaper.
+
+Pulls from two Guardian Open Platform queries and merges them:
+  - Latest articles, production office = Australia
+  - Latest articles, production office = Australia, section = technology
+
+Since a technology story can also show up in the general Australia
+feed, both queries are merged and checked against a single shared
+"seen" list, so an article that appears in both is only ever saved to
+Instapaper once.
 
 Requires:
     GUARDIAN_API_KEY       - free key from open-platform.theguardian.com/access
@@ -24,9 +34,17 @@ from requests.auth import HTTPBasicAuth
 
 GUARDIAN_SEARCH_URL = "https://content.guardianapis.com/search"
 
-# Scope to Guardian Australia, newest first.
-GUARDIAN_PARAMS = {
+# General Guardian Australia latest news.
+GUARDIAN_GENERAL_PARAMS = {
     "production-office": "aus",
+    "order-by": "newest",
+    "page-size": 20,
+}
+
+# Guardian, scoped to the technology section (global, not limited to
+# the Australia production office - tech coverage there is fairly light).
+GUARDIAN_TECH_PARAMS = {
+    "section": "technology",
     "order-by": "newest",
     "page-size": 20,
 }
@@ -49,13 +67,34 @@ def save_seen(seen: set) -> None:
     SEEN_FILE.write_text(json.dumps(trimmed, indent=2))
 
 
-def fetch_latest_articles(api_key: str) -> list:
-    params = dict(GUARDIAN_PARAMS)
+def fetch_articles(api_key: str, extra_params: dict) -> list:
+    params = dict(extra_params)
     params["api-key"] = api_key
     resp = requests.get(GUARDIAN_SEARCH_URL, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("response", {}).get("results", [])
+    articles = []
+    for item in data.get("response", {}).get("results", []):
+        url = item.get("webUrl")
+        title = item.get("webTitle", "Untitled")
+        if url:
+            articles.append({"url": url, "title": title})
+    return articles
+
+
+def fetch_all_articles(api_key: str) -> list:
+    """Fetch and merge articles from both Guardian queries, deduping within this run."""
+    all_articles = []
+    seen_urls_this_run = set()
+
+    for params in (GUARDIAN_GENERAL_PARAMS, GUARDIAN_TECH_PARAMS):
+        for article in fetch_articles(api_key, params):
+            if article["url"] in seen_urls_this_run:
+                continue
+            seen_urls_this_run.add(article["url"])
+            all_articles.append(article)
+
+    return all_articles
 
 
 def save_to_instapaper(url: str, title: str, username: str, password: str) -> None:
@@ -92,13 +131,13 @@ def main() -> int:
         return 1
 
     seen = load_seen()
-    articles = fetch_latest_articles(api_key)
+    articles = fetch_all_articles(api_key)
 
     new_count = 0
     for article in articles:
-        url = article.get("webUrl")
-        title = article.get("webTitle", "Untitled")
-        if not url or url in seen:
+        url = article["url"]
+        title = article["title"]
+        if url in seen:
             continue
 
         try:
