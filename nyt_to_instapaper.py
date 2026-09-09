@@ -1,34 +1,50 @@
 #!/usr/bin/env python3
 """
-Fetch trending New York Times articles and push any new ones to Instapaper.
+Fetch trending and top-stories New York Times articles and push any new
+ones to Instapaper.
+
+Pulls from two NYT sources and merges them:
+  - Most Popular API (most-viewed articles - a "trending" proxy)
+  - Top Stories API (editorially curated homepage top stories)
+
+Since both draw from overlapping NYT content, a story can appear in
+both. Both sources are merged and checked against a single shared
+"seen" list, so an article that appears in both is only ever saved to
+Instapaper once.
 
 Requires three environment variables (set as GitHub Actions secrets, or
 export them locally for testing):
     NYT_API_KEY            - free key from developer.nytimes.com
+                              (must have BOTH Most Popular API and
+                              Top Stories API enabled on the app)
     INSTAPAPER_USERNAME    - your Instapaper login email
     INSTAPAPER_PASSWORD    - your Instapaper login password
 
-Keeps a small JSON file (seen.json) of article URLs already sent, so the
-same article isn't saved twice. GitHub Actions commits this file back to
-the repo after each run so state persists between scheduled runs.
+Keeps a small JSON file (seen.json) of article URLs already sent, so
+the same article isn't saved twice. GitHub Actions commits this file
+back to the repo after each run so state persists between scheduled
+runs.
 """
 
 import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlencode
 
 import requests
 from requests.auth import HTTPBasicAuth
 
 # --- Config -----------------------------------------------------------
 
-# NYT "Most Popular" endpoint. Options: viewed, emailed, shared.
-# "viewed" over the last day is the closest free equivalent to "trending".
+# Most Popular endpoint. Options: viewed, emailed, shared.
 NYT_PERIOD_DAYS = 1
 NYT_METRIC = "viewed"  # viewed | emailed | shared
-NYT_URL = f"https://api.nytimes.com/svc/mostpopular/v2/{NYT_METRIC}/{NYT_PERIOD_DAYS}.json"
+NYT_MOST_POPULAR_URL = f"https://api.nytimes.com/svc/mostpopular/v2/{NYT_METRIC}/{NYT_PERIOD_DAYS}.json"
+
+# Top Stories endpoint. "home" is the general homepage top stories feed.
+# Other options include: world, politics, business, technology, sports, etc.
+NYT_TOP_STORIES_SECTION = "home"
+NYT_TOP_STORIES_URL = f"https://api.nytimes.com/svc/topstories/v2/{NYT_TOP_STORIES_SECTION}.json"
 
 INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
 
@@ -49,11 +65,45 @@ def save_seen(seen: set) -> None:
     SEEN_FILE.write_text(json.dumps(trimmed, indent=2))
 
 
-def fetch_trending_articles(api_key: str) -> list:
-    resp = requests.get(NYT_URL, params={"api-key": api_key}, timeout=30)
+def fetch_most_popular(api_key: str) -> list:
+    resp = requests.get(NYT_MOST_POPULAR_URL, params={"api-key": api_key}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("results", [])
+    articles = []
+    for item in data.get("results", []):
+        url = item.get("url")
+        title = item.get("title", "Untitled")
+        if url:
+            articles.append({"url": url, "title": title})
+    return articles
+
+
+def fetch_top_stories(api_key: str) -> list:
+    resp = requests.get(NYT_TOP_STORIES_URL, params={"api-key": api_key}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    articles = []
+    for item in data.get("results", []):
+        url = item.get("url")
+        title = item.get("title", "Untitled")
+        if url:
+            articles.append({"url": url, "title": title})
+    return articles
+
+
+def fetch_all_articles(api_key: str) -> list:
+    """Fetch and merge articles from both NYT sources, deduping within this run."""
+    all_articles = []
+    seen_urls_this_run = set()
+
+    for fetch_fn in (fetch_most_popular, fetch_top_stories):
+        for article in fetch_fn(api_key):
+            if article["url"] in seen_urls_this_run:
+                continue
+            seen_urls_this_run.add(article["url"])
+            all_articles.append(article)
+
+    return all_articles
 
 
 def save_to_instapaper(url: str, title: str, username: str, password: str) -> None:
@@ -90,13 +140,13 @@ def main() -> int:
         return 1
 
     seen = load_seen()
-    articles = fetch_trending_articles(api_key)
+    articles = fetch_all_articles(api_key)
 
     new_count = 0
     for article in articles:
-        url = article.get("url")
-        title = article.get("title", "Untitled")
-        if not url or url in seen:
+        url = article["url"]
+        title = article["title"]
+        if url in seen:
             continue
 
         try:
