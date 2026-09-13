@@ -24,6 +24,7 @@ scheduled runs.
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -49,6 +50,16 @@ INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
 SEEN_FILE = Path(__file__).parent / "newscomau_seen.json"
 MAX_SEEN_ENTRIES = 500
 
+# Matches a bare "&" that isn't already part of a valid XML entity
+# (e.g. &amp; &lt; &#39; &#x27;). news.com.au's feed sometimes contains
+# unescaped "&" characters in titles, which breaks strict XML parsing.
+_BARE_AMPERSAND_RE = re.compile(r"&(?!#\d+;|#x[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]*;)")
+
+# Control characters that aren't valid in XML 1.0 (except tab/newline/CR).
+_INVALID_XML_CHARS_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
+)
+
 # --- Helpers ------------------------------------------------------------
 
 def load_seen() -> set:
@@ -62,6 +73,19 @@ def save_seen(seen: set) -> None:
     SEEN_FILE.write_text(json.dumps(trimmed, indent=2))
 
 
+def sanitize_feed_xml(raw_bytes: bytes) -> bytes:
+    """
+    Fix common malformed-XML issues seen in real-world RSS feeds:
+    unescaped bare ampersands, and stray control characters. Both cause
+    strict XML parsers to abort early, well before any actual articles
+    are reached.
+    """
+    text = raw_bytes.decode("utf-8", errors="replace")
+    text = _BARE_AMPERSAND_RE.sub("&amp;", text)
+    text = _INVALID_XML_CHARS_RE.sub("", text)
+    return text.encode("utf-8")
+
+
 def fetch_articles() -> list:
     # Fetch the raw feed ourselves first (with a browser-like User-Agent),
     # then hand the content to feedparser, rather than letting feedparser
@@ -69,9 +93,11 @@ def fetch_articles() -> list:
     resp = requests.get(NEWSCOMAU_FEED_URL, headers=REQUEST_HEADERS, timeout=30)
     print(f"Feed request status: {resp.status_code}, {len(resp.content)} bytes received")
 
-    parsed = feedparser.parse(resp.content)
+    cleaned_content = sanitize_feed_xml(resp.content)
+
+    parsed = feedparser.parse(cleaned_content)
     if parsed.bozo:
-        print(f"Feed parsing warning: {parsed.bozo_exception}", file=sys.stderr)
+        print(f"Feed parsing warning (non-fatal): {parsed.bozo_exception}", file=sys.stderr)
 
     print(f"Feed entries found: {len(parsed.entries)}")
 
