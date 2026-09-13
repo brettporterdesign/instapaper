@@ -35,6 +35,15 @@ from requests.auth import HTTPBasicAuth
 
 NEWSCOMAU_FEED_URL = "https://www.news.com.au/content-feeds/latest-news-rss/"
 
+# Some publishers silently block requests with no browser-like User-Agent.
+# feedparser doesn't error in that case, it just returns zero entries.
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
 INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
 
 SEEN_FILE = Path(__file__).parent / "newscomau_seen.json"
@@ -54,7 +63,18 @@ def save_seen(seen: set) -> None:
 
 
 def fetch_articles() -> list:
-    parsed = feedparser.parse(NEWSCOMAU_FEED_URL)
+    # Fetch the raw feed ourselves first (with a browser-like User-Agent),
+    # then hand the content to feedparser, rather than letting feedparser
+    # make the request itself with its default (easily-blocked) headers.
+    resp = requests.get(NEWSCOMAU_FEED_URL, headers=REQUEST_HEADERS, timeout=30)
+    print(f"Feed request status: {resp.status_code}, {len(resp.content)} bytes received")
+
+    parsed = feedparser.parse(resp.content)
+    if parsed.bozo:
+        print(f"Feed parsing warning: {parsed.bozo_exception}", file=sys.stderr)
+
+    print(f"Feed entries found: {len(parsed.entries)}")
+
     articles = []
     for entry in parsed.entries:
         url = entry.get("link")
